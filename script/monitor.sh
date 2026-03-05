@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONTRACT="0x22c738cA7b87933949dedf66DC0D51F3F52f1bd6"
 POOL_ID="0x687d99f092f601193087bee4ceacc304673e5ef5a0df4e36f549f261cf08e24c"
 RPC_URL="${RPC_URL:-${ALCHEMY_API_KEY}}"
+EVENT_RPC="${EVENT_RPC:-${DRPC_API_KEY:-$RPC_URL}}"
 
 PRICE=400000000
 AMOUNT=20000000
@@ -20,6 +21,10 @@ ALERT_THRESHOLD=60
 ALERT_INTERVAL=2
 ATTACK_THRESHOLD=10
 ATTACK_RETRIES=5
+EVENT_POLL_INTERVAL=4
+
+TOPIC_ABANDONED="0x9afa667871f381adca1800df9f9085deceaddeff98584d5d6e34ca2e5bf60d6a"
+TOPIC_FORFEITED="0x54b885061e30e455013e6de4142690defbef2ccdb1a5b13db41de36217d82226"
 
 WALLET=$(cast wallet address --private-key "$PRIV_KEY")
 
@@ -67,6 +72,77 @@ attack_seat() {
   log "DONE — $ATTACK_RETRIES txs sent for seat $seat"
 }
 
+extract_seat_id() {
+  local log_entry="$1"
+  local topic2 data
+  topic2=$(echo "$log_entry" | jq -r '.topics[2] // empty' 2>/dev/null)
+  if [ -n "$topic2" ]; then
+    printf "%d" "$topic2" 2>/dev/null
+    return
+  fi
+  data=$(echo "$log_entry" | jq -r '.data // empty' 2>/dev/null)
+  if [ -n "$data" ] && [ "$data" != "0x" ] && [ ${#data} -ge 66 ]; then
+    printf "%d" "0x${data:2:64}" 2>/dev/null
+  fi
+}
+
+check_events() {
+  local current_block
+  current_block=$(cast block-number --rpc-url "$EVENT_RPC" 2>/dev/null) || return
+
+  if [ -z "$LAST_CHECKED_BLOCK" ]; then
+    LAST_CHECKED_BLOCK=$((current_block - 30))
+  fi
+
+  local from_block=$((LAST_CHECKED_BLOCK + 1))
+  [ "$from_block" -gt "$current_block" ] && return
+
+  for topic in "$TOPIC_ABANDONED" "$TOPIC_FORFEITED"; do
+    local event_name="SeatAbandoned"
+    [ "$topic" = "$TOPIC_FORFEITED" ] && event_name="SeatForfeited"
+
+    local logs
+    logs=$(cast logs --from-block "$from_block" --to-block "$current_block" \
+      --address "$CONTRACT" "$topic" \
+      --rpc-url "$EVENT_RPC" --json 2>/dev/null) || continue
+
+    local count
+    count=$(echo "$logs" | jq 'length' 2>/dev/null) || continue
+    [ "$count" -eq 0 ] && continue
+
+    for i in $(seq 0 $((count - 1))); do
+      local entry
+      entry=$(echo "$logs" | jq ".[$i]" 2>/dev/null) || continue
+
+      local pool_topic
+      pool_topic=$(echo "$entry" | jq -r '.topics[1] // empty' 2>/dev/null)
+      [ "$pool_topic" != "$POOL_ID" ] && continue
+
+      local seat_id
+      seat_id=$(extract_seat_id "$entry") || continue
+      [ -z "$seat_id" ] && continue
+
+      if grep -q "^${seat_id}$" "$SNAGGED_FILE" 2>/dev/null; then
+        continue
+      fi
+
+      log ""
+      log "========================================"
+      log "  EVENT: $event_name — seat $seat_id"
+      log "  IMMEDIATE ATTACK"
+      log "========================================"
+      attack_seat "$seat_id"
+      sleep 2
+      attack_seat "$seat_id"
+      sleep 2
+      attack_seat "$seat_id"
+      echo "$seat_id" >> "$SNAGGED_FILE"
+    done
+  done
+
+  LAST_CHECKED_BLOCK=$current_block
+}
+
 scan_all_seats() {
   local results_dir=$1
   local count=0
@@ -101,6 +177,7 @@ echo "Wallet:    $WALLET"
 echo "Seats:     0-$((TOTAL_SEATS - 1)) (all $TOTAL_SEATS)"
 echo "Bid:       price=$PRICE amount=$AMOUNT maxPrice=$MAX_PRICE"
 echo "Batching:  $BATCH_SIZE parallel queries"
+echo "Events:    polling every ${EVENT_POLL_INTERVAL}s (SeatAbandoned + SeatForfeited)"
 echo "Phases:    idle=${IDLE_INTERVAL}s | alert<${ALERT_THRESHOLD}s@${ALERT_INTERVAL}s | attack<${ATTACK_THRESHOLD}s"
 echo "========================================"
 echo ""
@@ -108,11 +185,14 @@ echo ""
 SNAGGED_FILE=$(mktemp)
 trap "rm -f $SNAGGED_FILE" EXIT
 
+LAST_CHECKED_BLOCK=""
 SCAN_COUNT=0
 
 while true; do
   SCAN_COUNT=$((SCAN_COUNT + 1))
   RESULTS_DIR=$(mktemp -d)
+
+  check_events
 
   log "SCAN #$SCAN_COUNT — querying all $TOTAL_SEATS seats..."
   scan_all_seats "$RESULTS_DIR"
@@ -212,12 +292,13 @@ while true; do
       fi
 
       log "SEAT $NEAREST_SEAT — ${TTF}s remaining — ALERT"
+      check_events
       sleep "$ALERT_INTERVAL"
     done
     continue
   fi
 
-  # Idle phase
+  # Idle phase — poll events between full scans
   SLEEP_TIME=$IDLE_INTERVAL
   if [ "$NEAREST_TIME" -lt 300 ]; then
     SLEEP_TIME=10
@@ -225,6 +306,11 @@ while true; do
     SLEEP_TIME=30
   fi
 
-  log "IDLE — next full scan in ${SLEEP_TIME}s"
-  sleep "$SLEEP_TIME"
+  log "IDLE — next full scan in ${SLEEP_TIME}s (event polling every ${EVENT_POLL_INTERVAL}s)"
+  ELAPSED=0
+  while [ "$ELAPSED" -lt "$SLEEP_TIME" ]; do
+    sleep "$EVENT_POLL_INTERVAL"
+    ELAPSED=$((ELAPSED + EVENT_POLL_INTERVAL))
+    check_events
+  done
 done
